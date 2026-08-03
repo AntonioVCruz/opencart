@@ -1,0 +1,186 @@
+name: testRigor E2E on OpenCart (localhost)
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      # testRigor
+      TESTRIGOR_SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID || 'tERoM8uHao9gHbZMN' }}
+
+      # Admin defaults used only by the generated compose (if the repo has none)
+      OPENCART_USERNAME: admin
+      OPENCART_PASSWORD: admin123
+      OPENCART_ADMIN_EMAIL: testing+opencart@testrigor.com
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Validate testRigor configuration
+        shell: bash
+        env:
+          TESTRIGOR_CI_TOKEN: ${{ secrets.TESTRIGOR_CI_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TESTRIGOR_SUITE_ID" ]; then
+            echo "::error::Repository variable TESTRIGOR_SUITE_ID is not configured."
+            exit 1
+          fi
+          if [ -z "$TESTRIGOR_CI_TOKEN" ]; then
+            echo "::error::Repository secret TESTRIGOR_CI_TOKEN is not configured."
+            exit 1
+          fi
+
+      # OPTIONAL: login to Docker Hub if you add these secrets later.
+      - name: Login to Docker Hub (optional)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@v4
+        with:
+          registry: docker.io
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      # If the repo doesn't already have a compose file, create a minimal one.
+      - name: Locate or create docker-compose file
+        id: compose
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+            if [ -f "$f" ]; then
+              echo "Found compose file: $f"
+              echo "COMPOSE_FILE=$f" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+
+          echo "No compose file found. Writing fallback compose.yaml (Bitnami on Docker Hub)…"
+          cat > compose.yaml <<'YAML'
+          services:
+            mariadb:
+              # Keep the database runtime compatible with the archived OpenCart image.
+              image: bitnamilegacy/mariadb:11.8.3-debian-12-r0
+              environment:
+                - MARIADB_ROOT_PASSWORD=root
+                - MARIADB_DATABASE=opencart
+                - MARIADB_USER=opencart
+                - MARIADB_PASSWORD=opencart
+              healthcheck:
+                test: ["CMD", "/opt/bitnami/mariadb/bin/mariadb-admin", "ping", "-h", "127.0.0.1", "-u", "opencart", "-popencart"]
+                interval: 5s
+                timeout: 5s
+                retries: 30
+                start_period: 10s
+
+            opencart:
+              # Bitnami removed OpenCart from its main public catalog in 2025.
+              image: bitnamilegacy/opencart-archived:4.0.2-3-debian-12-r36
+              restart: "on-failure:3"
+              depends_on:
+                mariadb:
+                  condition: service_healthy
+              environment:
+                - OPENCART_HOST=localhost
+                - OPENCART_USERNAME=${OPENCART_USERNAME}
+                - OPENCART_PASSWORD=${OPENCART_PASSWORD}
+                - OPENCART_EMAIL=${OPENCART_ADMIN_EMAIL}
+                - OPENCART_DATABASE_HOST=mariadb
+                - OPENCART_DATABASE_PORT_NUMBER=3306
+                - OPENCART_DATABASE_NAME=opencart
+                - OPENCART_DATABASE_USER=opencart
+                - OPENCART_DATABASE_PASSWORD=opencart
+              ports:
+                - "8080:8080"
+          YAML
+
+          echo "COMPOSE_FILE=compose.yaml" >> "$GITHUB_ENV"
+
+      - name: Prepare OpenCart bind mount permissions
+        shell: bash
+        run: |
+          sudo chown -R 1000:1000 upload
+
+      - name: Start services (docker-compose)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Using compose file: $COMPOSE_FILE"
+          docker compose -f "$COMPOSE_FILE" up -d --build --remove-orphans --quiet-pull
+          docker compose -f "$COMPOSE_FILE" ps
+
+      - name: Detect services and URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          WEB_SVC="opencart"
+          if ! docker compose -f "$COMPOSE_FILE" ps --services | grep -qx "$WEB_SVC"; then
+            WEB_SVC="$(docker compose -f "$COMPOSE_FILE" ps --services | head -n1)"
+          fi
+
+          PORT="$(docker compose -f "$COMPOSE_FILE" port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
+          if [ -z "$PORT" ]; then
+            PORT="$(docker compose -f "$COMPOSE_FILE" port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
+          fi
+
+          if [ -z "$PORT" ] || [ "$PORT" = "80" ]; then
+            LOCAL_BASE_URL="http://localhost"
+          else
+            LOCAL_BASE_URL="http://localhost:$PORT"
+          fi
+
+          echo "LOCAL_BASE_URL=$LOCAL_BASE_URL" >> "$GITHUB_ENV"
+          echo "Resolved LOCAL_BASE_URL=$LOCAL_BASE_URL"
+
+      - name: Wait for OpenCart to be reachable (prove localhost)
+        shell: bash
+        run: |
+          set -e
+          for i in {1..90}; do
+            if curl -fsS -o /dev/null -L "$LOCAL_BASE_URL"; then
+              echo "OpenCart is up at $LOCAL_BASE_URL"
+              exit 0
+            fi
+            echo "Waiting for OpenCart... ($i/90)"
+            sleep 3
+          done
+
+          echo "::group::Recent container logs"
+          docker compose -f "$COMPOSE_FILE" logs --no-color --tail=200
+          echo "::endgroup::"
+          exit 1
+
+      - name: Verify HTTP headers (sanity)
+        run: curl -LI "$LOCAL_BASE_URL" || true
+
+      - name: Setup Node.js (for testRigor CLI)
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install testRigor CLI
+        run: |
+          npm install -g testrigor-cli
+          testrigor --version
+
+      - name: Trigger testRigor suite against localhost
+        env:
+          TESTRIGOR_CI_TOKEN: ${{ secrets.TESTRIGOR_CI_TOKEN }}
+        run: |
+          echo "Suite ID: $TESTRIGOR_SUITE_ID"
+          echo "URL:      $LOCAL_BASE_URL"
+          npx -y testrigor-cli test-suite run "$TESTRIGOR_SUITE_ID" \
+            --token "$TESTRIGOR_CI_TOKEN" \
+            --localhost --url "$LOCAL_BASE_URL" \
+            --verbose
